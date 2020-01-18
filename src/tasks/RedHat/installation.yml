@@ -1,0 +1,140 @@
+---
+
+##########################################################################################
+# 
+# NOTE: THE installation part will completely fail, 
+# - if the system is not connected to proper copied RedHat Repositories 
+#   (no group definition available)
+# - is disconnected with no repos configured at all
+#
+##########################################################################################
+
+#- name: Enable Debugging
+#  debug:
+#    verbosity: "{{ debuglevel }}"
+#
+- name: ensure required packagegroups are installed
+  package: 
+    state: present 
+    name: "{{ sap_hana_preconfigure_packagegroups }}"
+    update_only: true
+  check_mode: "{{ sap_hana_preconfigure_installation_check_only }}"
+
+- name: ensure required packages are installed
+  package:
+    state: present
+    name: "{{ sap_hana_preconfigure_packages }}"
+  check_mode: "{{ sap_hana_preconfigure_installation_check_only }}"
+  register: sap_hana_preconfigure_register_groupinstall
+
+- name: Get status of installed packages
+  yum:
+    name: "{{ sap_hana_preconfigure_packages }}"
+  register: result
+  ignore_errors: True
+  changed_when: false
+- debug:
+    var: result.results
+
+- name: ensure system is updated to the latest patchlevel
+  package:
+    state: latest
+    name: "*"
+  when: sap_hana_preconfigure_update|bool
+  check_mode: "{{ sap_hana_preconfigure_installation_check_only }}"
+  register: sap_hana_preconfigure_register_packageinstall
+
+### If this task fails, you need to enable the IBM PowerTools repository
+### see https://www14.software.ibm.com/support/customercare/sas/f/lopdiags/home.html for details
+##
+### # yum -y install http://public.dhe.ibm.com/software/server/POWER/Linux/yum/download/ibm-power-repo-latest.noarch.rpm
+### # /opt/ibm/lop/configure
+### # yum -y install ibm-power-managed-rhel7
+###
+- name: Install IBM Tools 
+  package:
+    state: latest
+    name: "{{ sap_hana_preconfigure_required_ppc64le }}"
+  when: ansible_architecture == "ppc64le" 
+
+- name: check if reboot is required (7.3+)
+  command: needs-restarting -r
+  register: sap_hana_preconfigure_register_reboot_required
+  changed_when: false
+  failed_when: sap_hana_preconfigure_register_reboot_required.rc > 1 
+  when: ( ansible_distribution_version >= "7.3" ) and ( ansible_distribution_major_version == "7" )
+
+# This did not work properly because, the last register variable is used in the next when statement.
+#- name: check if reboot is required (7.2)
+#  command: needs-restarting
+#  register: reboot_required_72
+#  changed_when: false
+#  failed_when: reboot_required_72.rc > 1
+#  when: ( ansible_distribution_version == "7.2" ) and ( ansible_distribution_major_version == "7" )
+ 
+  # Not sure if this works for RHEL 7.2, 7.3, tested on 7.4+
+- name: Debug output of Reboot requirement
+  debug:
+    var: sap_hana_preconfigure_register_reboot_required 
+#   msg: "Reboot required: {{ sap_hana_preconfigure_register_reboot_required.rc }}"
+
+- name: Reboot if required
+  block:
+      # Reboot the server now and wait until it is back
+      # inspired by https://support.ansible.com/hc/en-us/articles/201958037-Reboot-a-server-and-wait-for-it-to-come-back
+      - name: restart machine if required
+        shell: sleep 2 && shutdown -r now "Ansible updates triggered"
+        async: 1
+        poll: 0
+        become: true
+        ignore_errors: true
+
+      - name: waiting for server to come back
+        local_action: wait_for host={{ inventory_hostname }} port=22 state=started delay=90 sleep=2 timeout={{ sap_hana_preconfigure_reboot_timeout }}
+        become: false
+  when: sap_hana_preconfigure_reboot_after_update == true and sap_hana_preconfigure_register_reboot_required.rc == 1
+
+### At this point the system should be updated and installed accordingly. 
+### We now check that the irequired minimum releases of the current target OS have been installed
+# Minimum supported Supported Kernel versions and patches to use with certified Hardware for SAP HANA on RHEL 7
+
+- name: ensure minimum packages are installed
+  block:
+    - name: check if minimum release needs to be installed
+      shell: |
+             set -x
+             required_pkg={{ pkg | join('-') }}
+             newest=$(echo -e "$required_pkg\n$(rpm -q {{ pkg[0] }} )"| sort -V | tail -1)
+             if [ $newest == $required_pkg ]; then
+                echo $newest
+             fi
+      loop: "{{ sap_hana_preconfigure_min_pkgs }}"
+      loop_control:
+               loop_var: pkg
+      check_mode: no
+      register: sap_hana_preconfigure_register_minpkglist
+      changed_when: false
+
+    - name: Initialize an empty list for our strings
+      set_fact:
+        sap_hana_preconfigure_fact_minpkglist: []
+
+    - name: Create list of packages to be installed
+      set_fact:
+        sap_hana_preconfigure_fact_minpkglist: "{{ sap_hana_preconfigure_fact_minpkglist | difference(['']) + [ pkg.stdout ] }}"
+      loop: "{{ sap_hana_preconfigure_register_minpkglist.results }}"
+      loop_control:
+               loop_var: pkg
+    - debug: var=sap_hana_preconfigure_fact_minpkglist
+
+    - name: Install minimum packages if required
+      yum:
+             name: "{{  sap_hana_preconfigure_fact_minpkglist }}"
+             state: present
+      when: not ( sap_hana_preconfigure_fact_minpkglist == [ "" ] )
+
+  when: 
+    - sap_hana_preconfigure_min_package_check|bool
+    - not( (sap_hana_preconfigure_min_pkgs is undefined) or (sap_hana_preconfigure_min_pkgs is none) or (sap_hana_preconfigure_min_pkgs | trim == '') ) 
+
+...
